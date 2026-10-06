@@ -1,0 +1,33 @@
+{
+  "auto_parse": {
+    "description": "收到图片时自动解析；无可识别元数据时保持静默",
+    "type": "bool",
+    "default": false
+  },
+  "max_file_size_mb": {
+    "description": "单张图片最大大小（MB）",
+    "type": "int",
+    "default": 20,
+    "hint": "超过限制的图片会被跳过"
+  },
+  "download_timeout_seconds": {
+    "description": "下载远程图片的超时时间（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "max_concurrent_images": {
+    "description": "一次消息最多并行解析的图片数量",
+    "type": "int",
+    "default": 3
+  },
+  "show_raw_metadata": {
+    "description": "是否在摘要后展示原始元数据",
+    "type": "bool",
+    "default": true
+  },
+  "raw_metadata_max_chars": {
+    "description": "原始元数据最大展示字符数",
+    "type": "int",
+    "default": 8000
+  }
+}
