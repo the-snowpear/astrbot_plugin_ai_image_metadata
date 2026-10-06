@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
-from metadata_parser import ParsedMetadata, parse_image
+from .metadata_parser import ParsedMetadata, parse_image
 
 try:
     from astrbot.api.event import AstrMessageEvent, filter
