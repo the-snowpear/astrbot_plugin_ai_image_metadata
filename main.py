@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import re
 import tempfile
 import urllib.request
-from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import unquote, urlparse
+from typing import Any
 
 from .metadata_parser import ParsedMetadata, parse_image
+from .message_sources import (
+    MediaSource,
+    collect_command_media,
+    extract_media,
+    local_path as _local_path,
+    resolve_reference,
+)
 
 try:
     from astrbot.api.event import AstrMessageEvent, filter
@@ -42,17 +48,20 @@ class ImageMetadataPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
         self.context = context
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self._semaphore = asyncio.Semaphore(max(1, self._int_config("max_concurrent_images", 3)))
 
-    @filter.command("kkt")
+    @filter.command("kkt", priority=10)
     async def kkt(self, event: AstrMessageEvent):
-        """解析当前消息中的一张或多张 AI 生图元数据。"""
-        images = _extract_images(event)
+        """解析当前消息或引用消息中的图片、PNG 文件元数据。"""
+        event._ai_image_metadata_command = True
+        images = await collect_command_media(
+            event, timeout=max(1, self._int_config("download_timeout_seconds", 15)),
+        )
         if not images:
-            yield event.plain_result("请在 /kkt 指令消息中附带图片。")
+            yield event.plain_result("未找到图片或文件。请附带图片发送 /kkt，或引用图片／PNG 文件消息后发送 /kkt。")
             return
-        results = await self._parse_images(images)
+        results = await self._parse_images(images, event)
         yield self._result_chain(event, results)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -60,34 +69,39 @@ class ImageMetadataPlugin(Star):
         """可选的自动解析监听器；无元数据时保持静默。"""
         if not self._bool_config("auto_parse", False):
             return
-        if str(getattr(event, "message_str", "")).strip().lower().startswith("/kkt"):
+        if getattr(event, "_ai_image_metadata_command", False) or re.match(
+            r"^/?kkt(?:\s|$)", str(getattr(event, "message_str", "")).strip(), re.I,
+        ):
             return
         images = _extract_images(event)
         if not images:
             return
-        results = await self._parse_images(images)
+        results = await self._parse_images(images, event)
         useful = [result for result in results if result.metadata.has_metadata]
         if useful:
             yield self._result_chain(event, useful)
 
-    async def _parse_images(self, images: list[Any]) -> list["ImageResult"]:
-        tasks = [self._parse_one(index, image) for index, image in enumerate(images, start=1)]
+    async def _parse_images(self, images: list[MediaSource], event: AstrMessageEvent) -> list["ImageResult"]:
+        tasks = [self._parse_one(index, image, event) for index, image in enumerate(images, start=1)]
         return list(await asyncio.gather(*tasks))
 
-    async def _parse_one(self, index: int, image: Any) -> "ImageResult":
+    async def _parse_one(self, index: int, image: MediaSource, event: AstrMessageEvent) -> "ImageResult":
         async with self._semaphore:
             path: str | None = None
             is_temp = False
             try:
                 path, label, is_temp = await _materialize_image(
-                    image,
+                    image, event,
                     max_bytes=max(1, self._int_config("max_file_size_mb", 20)) * 1024 * 1024,
                     timeout=max(1, self._int_config("download_timeout_seconds", 15)),
                 )
                 metadata = await asyncio.to_thread(parse_image, path)
                 return ImageResult(index=index, label=label, metadata=metadata)
             except Exception as exc:
-                return ImageResult(index=index, label="图片", error=str(exc))
+                logging.getLogger(__name__).warning(
+                    "图片元数据读取失败（%s）；可用 /kkt 查看失败原因", type(exc).__name__,
+                )
+                return ImageResult(index=index, label=image.name, error=str(exc))
             finally:
                 if path and is_temp:
                     try:
@@ -104,7 +118,8 @@ class ImageMetadataPlugin(Star):
                 raw_limit=max(0, self._int_config("raw_metadata_max_chars", 8000)),
             )
             nodes.append(_make_node(event, text))
-        return event.chain_result(nodes)
+        nodes_type = getattr(Comp, "Nodes", None)
+        return event.chain_result([nodes_type(nodes)] if nodes_type else nodes)
 
     def _bool_config(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default) if hasattr(self.config, "get") else default
@@ -126,57 +141,36 @@ class ImageResult:
         self.error = error
 
 
-def _extract_images(event: Any) -> list[Any]:
+def _extract_images(event: Any) -> list[MediaSource]:
     message = getattr(getattr(event, "message_obj", None), "message", None)
-    if not isinstance(message, Iterable) or isinstance(message, (str, bytes)):
-        return []
-    images = []
-    for component in message:
-        name = component.__class__.__name__.lower()
-        if name == "image" or "image" in name:
-            images.append(component)
-    return images
+    # Automatic mode remains limited to images in the current message.
+    return extract_media(message, include_files=False)
 
 
-async def _materialize_image(component: Any, max_bytes: int, timeout: int) -> tuple[str, str, bool]:
-    reference = None
-    for attr in ("file", "url", "path", "src"):
-        value = getattr(component, attr, None)
-        if value:
-            reference = value
-            break
-    if not isinstance(reference, str):
-        raise ValueError("图片消息缺少文件地址")
-    reference = reference.strip()
+async def _materialize_image(component: MediaSource, event: Any, max_bytes: int, timeout: int) -> tuple[str, str, bool]:
+    reference = await resolve_reference(component, event, timeout, max_bytes)
     if reference.startswith("data:"):
-        _, encoded = reference.split(",", 1)
-        data = base64.b64decode(encoded, validate=True)
-        return _write_temp(data, max_bytes), "Data URI", True
+        header, encoded = reference.split(",", 1)
+        if ";base64" not in header.lower():
+            raise ValueError("仅支持 base64 格式的 Data URI")
+        return _write_temp(_decode_base64(encoded, max_bytes), max_bytes), component.name, True
     if reference.startswith("base64://"):
-        data = base64.b64decode(reference[9:], validate=True)
-        return _write_temp(data, max_bytes), "base64 图片", True
+        return _write_temp(_decode_base64(reference[9:], max_bytes), max_bytes), component.name, True
     if re.match(r"^https?://", reference, re.I):
         data = await asyncio.to_thread(_download, reference, max_bytes, timeout)
-        return _write_temp(data, max_bytes), reference, True
+        return _write_temp(data, max_bytes), component.name, True
     path = _local_path(reference)
     if not path.is_file():
         raise ValueError("图片文件不存在")
     if path.stat().st_size > max_bytes:
         raise ValueError(f"图片超过 {max_bytes // 1024 // 1024} MB 限制")
-    return str(path), str(path), False
+    return str(path), component.name, False
 
 
-def _local_path(reference: str) -> Path:
-    if not reference.startswith("file://"):
-        return Path(reference)
-    parsed = urlparse(reference)
-    decoded = unquote(parsed.path)
-    # file:///C:/path is the usual Windows URI spelling.
-    if os.name == "nt" and decoded.startswith("/") and len(decoded) > 3 and decoded[2] == ":":
-        decoded = decoded[1:]
-    if parsed.netloc and parsed.netloc.lower() != "localhost":
-        decoded = f"//{parsed.netloc}{decoded}"
-    return Path(decoded)
+def _decode_base64(encoded: str, max_bytes: int) -> bytes:
+    if len(encoded) > 4 * ((max_bytes + 2) // 3):
+        raise ValueError("图片或文件超过大小限制")
+    return base64.b64decode(encoded, validate=True)
 
 
 def _write_temp(data: bytes, max_bytes: int) -> str:
@@ -223,11 +217,7 @@ def _make_node(event: Any, text: str) -> Any:
             sender_id = str(event.get_self_id())
         except Exception:
             pass
-        try:
-            uin = int(sender_id)
-        except ValueError:
-            uin = 0
-        return node_type(uin=uin, name="AI Image Metadata", content=[plain_type(text)])
+        return node_type(uin=sender_id, name="AI Image Metadata", content=[plain_type(text)])
     return text
 
 

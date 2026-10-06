@@ -1,7 +1,7 @@
 name: astrbot_plugin_ai_image_metadata
 display_name: AI 图片元数据解析
 desc: 解析 AI 生图 PNG 内嵌元数据，支持 A1111、ComfyUI 和 NovelAI/NAI
-version: v0.1.1
+version: v0.1.2
 author: the-snowpear
 repo: https://github.com/the-snowpear/astrbot_plugin_ai_image_metadata
 astrbot_version: ">=4.11.2"

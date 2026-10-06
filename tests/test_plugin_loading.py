@@ -18,6 +18,7 @@ class PluginLoadingTests(unittest.TestCase):
             plugin = host / "data" / "plugins" / "astrbot_plugin_ai_image_metadata"
             plugin.mkdir(parents=True)
             shutil.copy2(project / "main.py", plugin / "main.py")
+            shutil.copy2(project / "message_sources.py", plugin / "message_sources.py")
             shutil.copytree(
                 project / "metadata_parser",
                 plugin / "metadata_parser",
